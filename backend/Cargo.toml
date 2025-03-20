@@ -7,9 +7,13 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
-path = "lib.rs"
 
 [dependencies]
 candid = "0.10.13"
 ic-cdk = "0.17.1"
-ic-llm = "0.3.0"
+ic-llm = "0.4.0"
+ic-stable-structures = "0.6.8"
+serde = "1.0.219"
+serde_bytes = "0.11.17"
+ciborium = "0.2.2"
+lopdf = "0.36.0"

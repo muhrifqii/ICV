@@ -1,6 +1,10 @@
 use ic_cdk::update;
 use ic_llm::{ChatMessage, Model};
 
+mod knowledge;
+mod entities;
+mod service;
+
 #[update]
 async fn prompt(prompt_str: String) -> String {
     ic_llm::prompt(Model::Llama3_1_8B, prompt_str).await

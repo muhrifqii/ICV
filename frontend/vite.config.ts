@@ -6,7 +6,12 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   base: './',
-  plugins: [react(), tailwindcss(), environment('all', { prefix: 'CANISTER_' }), environment('all', { prefix: 'DFX_' })],
+  plugins: [
+    react(),
+    tailwindcss(),
+    environment('all', { prefix: 'CANISTER_' }),
+    environment('all', { prefix: 'DFX_' })
+  ],
   envDir: '../',
   define: {
     'process.env': process.env
@@ -21,14 +26,13 @@ export default defineConfig({
   resolve: {
     alias: [
       {
-        find: 'declarations',
-        replacement: fileURLToPath(new URL('../src/declarations', import.meta.url))
+        find: '@declarations',
+        replacement: fileURLToPath(new URL('../declarations', import.meta.url))
       },
       {
         find: '@',
         replacement: fileURLToPath(new URL('./src', import.meta.url))
       }
-
     ]
   },
   server: {
@@ -39,6 +43,5 @@ export default defineConfig({
       }
     },
     host: '127.0.0.1'
-  },
-
-});
+  }
+})
