@@ -1,3 +1,5 @@
 /backend
 node_modules
 /target
+/coverage
+package-lock.json
