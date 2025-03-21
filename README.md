@@ -1,8 +1,29 @@
-# ICV - Your AI Career Coach on ICP Smart Contract
+<p align="center">
+  <img src="https://raw.githubusercontent.com/muhrifqii/ICV/master/frontend/public/logo.svg" />
+</p>
+<h1 align="center">ICV - Your AI Career Coach on ICP Smart Contract</h1>
+<p align="center">
+  <a href="#">
+    <img src="https://img.shields.io/badge/rust-1.85.0-orange"/>
+  </a>
+  <a href="#">
+    <img src="https://img.shields.io/badge/node-18.18.0-blue"/>
+  </a>
+  <a href="#">
+    <img src="https://img.shields.io/badge/dfx-0.25.0-magenta"/>
+  </a>
+  <a href="https://codecov.io/gh/muhrifqii/ICV">
+    <img src="https://codecov.io/gh/muhrifqii/ICV/graph/badge.svg?token=H0IAAX0QPR"/>
+  </a>
+  <a href="https://github.com/muhrifqii/ICV/blob/master/LICENSE">
+    <img src="https://img.shields.io/github/license/muhrifqii/ICV"/>
+  </a>
+</p>
+<p align="center">
+An <b>LLM-powered AI career coach</b> running on <b>Internet Computer Protocol (ICP)</b> smart contracts. This project provides job seekers with expert career guidance through a chat interface, helping with resume reviews, interview prep, salary negotiation, and more.
+</p>
 
-An **LLM-powered AI career coach** running on **Internet Computer Protocol (ICP)** smart contracts. This project provides job seekers with expert career guidance through a **chat interface**, helping with resume reviews, interview prep, salary negotiation, and more.
-
-![LLM Chatbot](https://icp.ninja/examples/_attachments/llm_chatbot.png)
+---
 
 ## Tech Stack
 
