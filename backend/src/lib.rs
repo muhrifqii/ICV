@@ -1,9 +1,10 @@
 use ic_cdk::update;
 use ic_llm::{ChatMessage, Model};
 
-mod knowledge;
 mod entities;
+mod knowledge;
 mod service;
+mod utils;
 
 #[update]
 async fn prompt(prompt_str: String) -> String {
