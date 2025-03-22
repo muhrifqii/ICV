@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Reverse, collections::HashSet};
+use std::{cell::RefCell, cmp::Reverse};
 
 use bitcode::{Decode, Encode};
 use candid::{CandidType, Principal};
@@ -12,8 +12,10 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Represents a timestamp in the system.
 pub type Timestamp = u64;
 
+/// Enum representing different roles in the system.
 #[derive(CandidType, Serialize, Deserialize, Encode, Decode, Clone, PartialEq, Eq, Debug)]
 pub enum Roles {
     #[serde(rename = "system")]
@@ -24,8 +26,10 @@ pub enum Roles {
     Assistant,
 }
 
+/// Represents a unique identifier for a message.
 pub type MessageId = u64;
 
+/// Struct representing a message in a conversation.
 #[derive(CandidType, Serialize, Deserialize, Encode, Decode, Clone, PartialEq, Eq, Debug)]
 pub struct Message {
     pub id: MessageId,
@@ -35,8 +39,10 @@ pub struct Message {
     pub role: Roles,
 }
 
+/// Represents a unique identifier for a conversation.
 pub type ConversationId = u64;
 
+/// Struct representing a conversation between users.
 #[derive(CandidType, Serialize, Deserialize, Encode, Decode, Clone, PartialEq, Eq, Debug)]
 pub struct Conversation {
     pub id: ConversationId,
@@ -45,8 +51,10 @@ pub struct Conversation {
     pub name: String,
 }
 
+/// Represents a unique identifier for a user.
 pub type UserId = u64;
 
+/// Struct representing a user in the system.
 #[derive(CandidType, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct User {
     pub id: UserId,
@@ -55,6 +63,7 @@ pub struct User {
     pub resume: String,
 }
 
+/// Enum representing different ways to sort conversations.
 #[derive(
     CandidType, Serialize, Deserialize, Encode, Decode, Clone, PartialEq, Eq, PartialOrd, Ord, Debug,
 )]
@@ -110,6 +119,7 @@ impl Storable for ConversationSortKind {
 }
 
 impl Roles {
+    /// Converts a `Roles` enum to an `ic_llm::Role`.
     pub fn to_ic_role(&self) -> Role {
         match *self {
             Roles::Assistant => Role::Assistant,
@@ -120,6 +130,7 @@ impl Roles {
 }
 
 impl Message {
+    /// Converts a `Message` struct to an `ic_llm::ChatMessage`.
     pub fn to_ic_message(&self) -> ChatMessage {
         ChatMessage {
             role: self.role.to_ic_role(),
@@ -252,10 +263,19 @@ pub trait IndexManagementRepository<I, T> {
     type Criteria;
     type Cursor;
 
+    /// Checks if an index exists.
     fn exists(&self, index: &I) -> bool;
+
+    /// Inserts a new index.
     fn insert(&self, index: I);
+
+    /// Removes an index.
     fn remove(&self, index: &I) -> bool;
+
+    /// Clears all indexes.
     fn clear(&self);
+
+    /// Finds entities based on criteria and cursor with a limit.
     fn find(&self, criteria: Self::Criteria, cursor: Option<Self::Cursor>, limit: usize) -> Vec<T>;
 }
 
@@ -333,10 +353,12 @@ impl SerialIdRepository<Memo> for MessageRepository {
 }
 
 impl MessageRepository {
+    /// Retrieves a message by its ID.
     pub fn get(&self, id: &MessageId) -> Option<Message> {
         CHAT_MESSAGE.with_borrow(|m| m.get(&Reverse(*id)))
     }
 
+    /// Inserts a new message into the repository.
     pub fn insert(&self, mut msg: Message) -> ResultRepository<Message> {
         let id = self.next_id();
         msg.id = id;
@@ -345,6 +367,7 @@ impl MessageRepository {
         Ok(msg)
     }
 
+    /// Retrieves a paginated list of messages for a conversation.
     pub fn paged_list(
         &self,
         conversation: ConversationId,
@@ -441,6 +464,7 @@ impl SerialIdRepository<Memo> for ConversationRepository {
 }
 
 impl ConversationRepository {
+    /// Inserts or updates a conversation in the repository.
     pub fn upsert(&self, mut conversation: Conversation) -> ResultRepository<Conversation> {
         if let Some(old_conv) = self.get(&conversation.id) {
             if old_conv.user != conversation.user {
@@ -460,10 +484,12 @@ impl ConversationRepository {
         Ok(conversation)
     }
 
+    /// Retrieves a conversation by its ID.
     pub fn get(&self, id: &ConversationId) -> Option<Conversation> {
         CONVERSATION.with_borrow(|m| m.get(id))
     }
 
+    /// Retrieves a paginated list of conversations for a user.
     pub fn paged_list(
         &self,
         user_id: UserId,
@@ -492,6 +518,7 @@ mod tests {
 
     fn reset_conv_data() {
         CONVERSATION.with_borrow_mut(|m| m.clear_new());
+        CONVERSATION_USER_INDEX.with_borrow_mut(|m| m.clear_new());
         NEXT_CONVERSATION_ID.with_borrow_mut(|v| v.set(1).unwrap());
     }
 
@@ -642,5 +669,74 @@ mod tests {
         // conv 2 out of limit
         let (_, conv2) = repo.paged_list(2, Some(8), 5);
         assert_eq!(conv2.iter().map(|m| m.id).collect::<Vec<_>>(), vec![7, 6]);
+    }
+
+    #[test]
+    fn get_and_upsert_conversation_should_work() {
+        reset_conv_data();
+        let repo = ConversationRepository::default();
+        let conversation = Conversation {
+            id: 1,
+            user: 1,
+            updated_at: 1234567890,
+            name: "Test Conversation".to_string(),
+        };
+        repo.upsert(conversation.clone()).unwrap();
+        assert!(repo.get(&1).is_some());
+        assert_eq!("Test Conversation".to_string(), repo.get(&1).unwrap().name);
+    }
+
+    #[test]
+    fn conversation_cursor_paged_list_should_return_correct_list() {
+        reset_conv_data();
+        let repo = ConversationRepository::default();
+
+        // 1-5 for user 1
+        for i in 1..=5 {
+            repo.upsert(Conversation {
+                id: i,
+                user: 1,
+                updated_at: i,
+                name: format!("Conversation {}", i),
+            })
+            .unwrap();
+        }
+        // 6-9 for user 2
+        for i in 6..=9 {
+            repo.upsert(Conversation {
+                id: i,
+                user: 2,
+                updated_at: i,
+                name: format!("Conversation {}", i),
+            })
+            .unwrap();
+        }
+        // 10 for user 1
+        repo.upsert(Conversation {
+            id: 10,
+            user: 1,
+            updated_at: 10,
+            name: format!("Conversation {}", 10),
+        })
+        .unwrap();
+
+        // Initial load (latest 3 conversations for user 1)
+        let (next_cursor, page1) = repo.paged_list(1, None, 3);
+        assert_eq!(
+            page1.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![10, 5, 4]
+        );
+        assert_eq!(next_cursor.unwrap(), 4);
+
+        // Scroll up (older than 10)
+        let (_, page2) = repo.paged_list(1, Some(10), 3);
+        assert_eq!(
+            page2.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![5, 4, 3]
+        );
+
+        // user 2 out of limit
+        let (_, user2) = repo.paged_list(2, Some(8), 5);
+        assert_eq!(user2.iter().map(|c| c.id).collect::<Vec<_>>(), vec![7, 6]);
     }
 }
