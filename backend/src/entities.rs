@@ -12,6 +12,11 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(all(test, not(rust_analyzer)))]
+use crate::utils::mock_timestamp::timestamp;
+#[cfg(any(not(test), rust_analyzer))]
+use crate::utils::timestamp;
+
 /// Represents a timestamp in the system.
 pub type Timestamp = u64;
 
@@ -63,15 +68,6 @@ pub struct User {
     pub resume: String,
 }
 
-/// Enum representing different ways to sort conversations.
-#[derive(
-    CandidType, Serialize, Deserialize, Encode, Decode, Clone, PartialEq, Eq, PartialOrd, Ord, Debug,
-)]
-pub enum ConversationSortKind {
-    ByUpdatedAt(Timestamp), // Newest first
-    ByName(String),         // Alphabetical natural order
-}
-
 impl Storable for Message {
     fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
         std::borrow::Cow::Owned(bitcode::encode(self))
@@ -103,17 +99,6 @@ impl Storable for User {
 
     fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
         ciborium::from_reader(bytes.as_ref()).unwrap()
-    }
-    const BOUND: Bound = Bound::Unbounded;
-}
-
-impl Storable for ConversationSortKind {
-    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
-        std::borrow::Cow::Owned(bitcode::encode(self))
-    }
-
-    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
-        bitcode::decode(bytes.as_ref()).unwrap()
     }
     const BOUND: Bound = Bound::Unbounded;
 }
@@ -210,7 +195,17 @@ pub enum RepositoryError {
     IllegalUpdate { reason: String },
 }
 
-pub type ResultRepository<T> = Result<T, RepositoryError>;
+pub type RepositoryResult<T> = Result<T, RepositoryError>;
+
+pub trait Repository<K, V>
+where
+    K: Clone + Ord + Storable,
+    V: Clone + Storable,
+{
+    fn get(&self, id: &K) -> Option<V>;
+    fn insert(&self, value: V) -> RepositoryResult<V>;
+    fn update(&self, value: V) -> RepositoryResult<V>;
+}
 
 pub trait SerialIdRepository<M>
 where
@@ -352,21 +347,30 @@ impl SerialIdRepository<Memo> for MessageRepository {
     }
 }
 
-impl MessageRepository {
+impl Repository<MessageId, Message> for MessageRepository {
     /// Retrieves a message by its ID.
-    pub fn get(&self, id: &MessageId) -> Option<Message> {
+    fn get(&self, id: &MessageId) -> Option<Message> {
         CHAT_MESSAGE.with_borrow(|m| m.get(&Reverse(*id)))
     }
 
     /// Inserts a new message into the repository.
-    pub fn insert(&self, mut msg: Message) -> ResultRepository<Message> {
-        let id = self.next_id();
-        msg.id = id;
-        let prev = CHAT_MESSAGE.with_borrow_mut(|m| m.insert(Reverse(id), msg.clone()));
+    fn insert(&self, mut msg: Message) -> RepositoryResult<Message> {
+        msg.id = self.next_id();
+        msg.timestamp = timestamp();
+        let prev = CHAT_MESSAGE.with_borrow_mut(|m| m.insert(Reverse(msg.id), msg.clone()));
         self.save_indexes(&msg, prev.as_ref());
         Ok(msg)
     }
 
+    /// Update will always Error, because message is immutable on current design.
+    fn update(&self, value: Message) -> RepositoryResult<Message> {
+        Err(RepositoryError::IllegalUpdate {
+            reason: "Message entity cannot be updated".to_string(),
+        })
+    }
+}
+
+impl MessageRepository {
     /// Retrieves a paginated list of messages for a conversation.
     pub fn paged_list(
         &self,
@@ -463,9 +467,25 @@ impl SerialIdRepository<Memo> for ConversationRepository {
     }
 }
 
-impl ConversationRepository {
-    /// Inserts or updates a conversation in the repository.
-    pub fn upsert(&self, mut conversation: Conversation) -> ResultRepository<Conversation> {
+impl Repository<ConversationId, Conversation> for ConversationRepository {
+    /// Retrieves a conversation by its ID.
+    fn get(&self, id: &ConversationId) -> Option<Conversation> {
+        CONVERSATION.with_borrow(|m| m.get(id))
+    }
+
+    /// Inserts a new conversation into the repository.
+    fn insert(&self, mut conversation: Conversation) -> RepositoryResult<Conversation> {
+        conversation.id = self.next_id();
+        conversation.updated_at = timestamp();
+        let prev =
+            CONVERSATION.with_borrow_mut(|m| m.insert(conversation.id, conversation.clone()));
+        self.save_indexes(&conversation, prev.as_ref());
+
+        Ok(conversation)
+    }
+
+    /// Update the conversation on the repository.
+    fn update(&self, mut conversation: Conversation) -> RepositoryResult<Conversation> {
         if let Some(old_conv) = self.get(&conversation.id) {
             if old_conv.user != conversation.user {
                 return Err(RepositoryError::IllegalUpdate {
@@ -473,23 +493,27 @@ impl ConversationRepository {
                 });
             }
         } else {
-            conversation.id = self.next_id();
+            return Err(RepositoryError::NotFound);
         }
-
+        conversation.updated_at = timestamp();
         let prev =
             CONVERSATION.with_borrow_mut(|m| m.insert(conversation.id, conversation.clone()));
-
         self.save_indexes(&conversation, prev.as_ref());
 
         Ok(conversation)
     }
+}
 
-    /// Retrieves a conversation by its ID.
-    pub fn get(&self, id: &ConversationId) -> Option<Conversation> {
-        CONVERSATION.with_borrow(|m| m.get(id))
+impl ConversationRepository {
+    /// Inserts or updates a conversation in the repository.
+    pub fn upsert(&self, conversation: Conversation) -> RepositoryResult<Conversation> {
+        match self.get(&conversation.id) {
+            Some(_) => self.update(conversation),
+            None => self.insert(conversation),
+        }
     }
 
-    /// Retrieves a paginated list of conversations for a user.
+    /// Retrieves a paginated list of conversations for a user. Cursor is using Timestamp instead of id
     pub fn paged_list(
         &self,
         user_id: UserId,
@@ -506,8 +530,12 @@ impl ConversationRepository {
     }
 }
 
+pub struct UserRepository;
+
 #[cfg(test)]
 mod tests {
+    use crate::utils::mock_timestamp;
+
     use super::*;
 
     fn reset_msg_data() {
@@ -615,6 +643,21 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn update_message_should_failed() {
+        reset_msg_data();
+        let repo = MessageRepository::default();
+        repo.update(Message {
+            id: 1,
+            conversation: 1,
+            content: "one".to_string(),
+            timestamp: 0,
+            role: Roles::Assistant,
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn message_cursor_paged_list_should_return_correct_list() {
         reset_msg_data();
         let repo = MessageRepository::default();
@@ -689,6 +732,7 @@ mod tests {
     #[test]
     fn conversation_cursor_paged_list_should_return_correct_list() {
         reset_conv_data();
+        mock_timestamp::reset_to(1);
         let repo = ConversationRepository::default();
 
         // 1-5 for user 1
