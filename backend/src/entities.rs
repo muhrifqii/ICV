@@ -136,6 +136,8 @@ const CONVERSATION_MEMORY_ID: MemoryId = MemoryId::new(3);
 const USER_MEMORY_ID: MemoryId = MemoryId::new(4);
 const CHAT_MESSAGE_CONVERSATION_INDEX_MEMORY_ID: MemoryId = MemoryId::new(5);
 const CONVERSATION_UPDATED_INDEX_MEMORY_ID: MemoryId = MemoryId::new(6);
+const USER_PRINCIPAL_INDEX_MEMORY_ID: MemoryId = MemoryId::new(7);
+const SERIAL_USER_MEMORY_ID: MemoryId = MemoryId::new(8);
 
 thread_local! {
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> = RefCell::new(
@@ -182,6 +184,18 @@ thread_local! {
         StableBTreeMap::init(
             MEMORY_MANAGER.with_borrow(|m| m.get(CONVERSATION_UPDATED_INDEX_MEMORY_ID))
         )
+    );
+
+    static USER_PRINCIPAL_INDEX: BTreeMapCell<(Principal, UserId), ()> = RefCell::new(
+        StableBTreeMap::init(
+            MEMORY_MANAGER.with_borrow(|m|m.get(USER_PRINCIPAL_INDEX_MEMORY_ID))
+        )
+    );
+
+    static NEXT_USER_ID: BigSerialCell = RefCell::new(
+        StableCell::init(
+            MEMORY_MANAGER.with_borrow(|m| m.get(SERIAL_USER_MEMORY_ID)), 1
+        ).expect("failed to init NEXT_USER_ID")
     );
 }
 
@@ -530,7 +544,101 @@ impl ConversationRepository {
     }
 }
 
-pub struct UserRepository;
+#[derive(Debug, Default)]
+pub struct UserIdentityIndexRepository;
+
+#[derive(Debug, Default)]
+pub struct UserRepository {
+    identity_index: UserIdentityIndexRepository,
+}
+
+impl IndexManagementRepository<(Principal, UserId), UserId> for UserIdentityIndexRepository {
+    type Criteria = Principal;
+    type Cursor = UserId;
+
+    fn exists(&self, index: &(Principal, UserId)) -> bool {
+        USER_PRINCIPAL_INDEX.with_borrow(|m| m.get(index).is_some())
+    }
+
+    fn insert(&self, index: (Principal, UserId)) {
+        USER_PRINCIPAL_INDEX.with_borrow_mut(|m| m.insert(index, ()));
+    }
+
+    fn remove(&self, index: &(Principal, UserId)) -> bool {
+        USER_PRINCIPAL_INDEX.with_borrow_mut(|m| m.remove(index).is_some())
+    }
+
+    fn clear(&self) {
+        USER_PRINCIPAL_INDEX.with_borrow_mut(|m| m.clear_new());
+    }
+
+    fn find(
+        &self,
+        principal: Self::Criteria,
+        _cursor: Option<Self::Cursor>,
+        _limit: usize,
+    ) -> Vec<UserId> {
+        let start = (principal, 1);
+        let end = (principal, UserId::MAX);
+        USER_PRINCIPAL_INDEX
+            .with_borrow(|m| m.range(start..=end).map(|((_, id), _)| id).collect_vec())
+    }
+}
+
+impl IndexedRepository<User> for UserRepository {
+    fn remove_indexes(&self, value: &User) {
+        self.identity_index.remove(&(value.identity, value.id));
+    }
+
+    fn add_indexes(&self, value: &User) {
+        self.identity_index.insert((value.identity, value.id));
+    }
+
+    fn clear_indexes(&self) {
+        self.identity_index.clear();
+    }
+}
+
+impl SerialIdRepository<Memo> for UserRepository {
+    fn with_generator<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut StableCell<u64, Memo>) -> R,
+    {
+        NEXT_USER_ID.with_borrow_mut(|m| f(m))
+    }
+}
+
+impl Repository<UserId, User> for UserRepository {
+    fn get(&self, id: &UserId) -> Option<User> {
+        USER.with_borrow(|m| m.get(id))
+    }
+
+    fn insert(&self, mut user: User) -> RepositoryResult<User> {
+        user.id = self.next_id();
+        let prev = USER.with_borrow_mut(|m| m.insert(user.id, user.clone()));
+        self.save_indexes(&user, prev.as_ref());
+        Ok(user)
+    }
+
+    fn update(&self, user: User) -> RepositoryResult<User> {
+        if self.get(&user.id).is_none() {
+            return Err(RepositoryError::NotFound);
+        }
+        let prev = USER.with_borrow_mut(|m| m.insert(user.id, user.clone()));
+        self.save_indexes(&user, prev.as_ref());
+        Ok(user)
+    }
+}
+
+impl UserRepository {
+    pub fn get_by_identity(&self, identity: Principal) -> Option<User> {
+        self.identity_index
+            .find(identity, None, 0)
+            .iter()
+            .filter_map(|id| self.get(id))
+            .last()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -548,6 +656,12 @@ mod tests {
         CONVERSATION.with_borrow_mut(|m| m.clear_new());
         CONVERSATION_USER_INDEX.with_borrow_mut(|m| m.clear_new());
         NEXT_CONVERSATION_ID.with_borrow_mut(|v| v.set(1).unwrap());
+    }
+
+    fn reset_user_data() {
+        USER.with_borrow_mut(|m| m.clear_new());
+        USER_PRINCIPAL_INDEX.with_borrow_mut(|m| m.clear_new());
+        NEXT_USER_ID.with_borrow_mut(|m| m.set(1).unwrap());
     }
 
     #[test]
@@ -782,5 +896,45 @@ mod tests {
         // user 2 out of limit
         let (_, user2) = repo.paged_list(2, Some(8), 5);
         assert_eq!(user2.iter().map(|c| c.id).collect::<Vec<_>>(), vec![7, 6]);
+    }
+
+    #[test]
+    fn get_and_insert_user_should_work() {
+        reset_user_data();
+        let repo = UserRepository::default();
+        let user = User {
+            id: 0,
+            username: "fulan".to_string(),
+            identity: Principal::anonymous(),
+            resume: "profile".to_string(),
+        };
+        repo.insert(user).unwrap();
+        assert!(repo.get(&1).is_some());
+        assert_eq!("fulan", repo.get(&1).unwrap().username);
+    }
+
+    #[test]
+    fn get_user_by_identity_should_work() {
+        reset_user_data();
+        let repo = UserRepository::default();
+
+        let identity = Principal::from_text("2chl6-4hpzw-vqaaa-aaaaa-c").unwrap();
+        repo.insert(User {
+            id: 0,
+            username: "user1".to_string(),
+            identity: identity.clone(),
+            resume: "user1".to_string(),
+        })
+        .unwrap();
+        repo.insert(User {
+            id: 0,
+            username: "user2".to_string(),
+            identity: Principal::anonymous(),
+            resume: "user2".to_string(),
+        })
+        .unwrap();
+        let q = repo.get_by_identity(identity);
+        assert!(q.is_some());
+        assert_eq!("user1", q.unwrap().username);
     }
 }
