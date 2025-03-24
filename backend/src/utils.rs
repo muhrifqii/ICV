@@ -21,11 +21,14 @@ pub fn timestamp() -> u64 {
 }
 
 #[cfg(test)]
-pub mod mock_timestamp {
-    use std::cell::Cell;
+pub mod mock_ic0 {
+    use std::cell::{Cell, RefCell};
+
+    use candid::Principal;
 
     thread_local! {
         static TIMESTAMP: Cell<u64> = Cell::new(0);
+        static CALLER: RefCell<String> = RefCell::new("2chl6-4hpzw-vqaaa-aaaaa-c".to_string());
     }
 
     pub fn timestamp() -> u64 {
@@ -34,7 +37,19 @@ pub mod mock_timestamp {
         ts
     }
 
-    pub fn reset_to(time: u64) {
+    pub fn caller() -> Principal {
+        Principal::from_text(CALLER.with_borrow(|s| s.clone()).as_str()).unwrap()
+    }
+
+    pub fn set_caller(caller: String) {
+        CALLER.with_borrow_mut(|s| *s = caller);
+    }
+
+    pub fn reset_caller() {
+        CALLER.with_borrow_mut(|s| *s = "2chl6-4hpzw-vqaaa-aaaaa-c".to_string());
+    }
+
+    pub fn reset_timestamp_to(time: u64) {
         TIMESTAMP.with(|c| c.set(time));
     }
 }

@@ -79,6 +79,7 @@ dependencies = [
  "ic-llm",
  "ic-stable-structures",
  "itertools",
+ "lazy_static",
  "lopdf",
  "serde",
  "serde_bytes",

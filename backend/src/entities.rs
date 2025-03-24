@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Reverse};
+use std::{cell::RefCell, cmp::Reverse, str::FromStr, sync::Arc};
 
 use bitcode::{Decode, Encode};
 use candid::{CandidType, Principal};
@@ -9,11 +9,12 @@ use ic_stable_structures::{
     DefaultMemoryImpl, Memory, StableBTreeMap, StableCell, Storable,
 };
 use itertools::Itertools;
+use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(all(test, not(rust_analyzer)))]
-use crate::utils::mock_timestamp::timestamp;
+use crate::utils::mock_ic0::timestamp;
 #[cfg(any(not(test), rust_analyzer))]
 use crate::utils::timestamp;
 
@@ -63,9 +64,15 @@ pub type UserId = u64;
 #[derive(CandidType, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct User {
     pub id: UserId,
-    pub username: String,
+    pub fullname: String,
     pub identity: Principal,
     pub resume: String,
+}
+
+#[derive(Error, Debug, Eq, PartialEq, Clone)]
+pub enum EntityError {
+    #[error(r#"Such role does not exist."#)]
+    UnknownRoles,
 }
 
 impl Storable for Message {
@@ -103,8 +110,22 @@ impl Storable for User {
     const BOUND: Bound = Bound::Unbounded;
 }
 
+impl FromStr for Roles {
+    type Err = EntityError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let r = match s {
+            "assistant" => Self::Assistant,
+            "user" => Self::User,
+            "system" => Self::System,
+            _ => return Err(EntityError::UnknownRoles),
+        };
+        Ok(r)
+    }
+}
+
 impl Roles {
-    /// Converts a `Roles` enum to an `ic_llm::Role`.
+    /// Converts a `Roles` to an `ic_llm::Role`.
     pub fn to_ic_role(&self) -> Role {
         match *self {
             Roles::Assistant => Role::Assistant,
@@ -219,6 +240,7 @@ where
     fn get(&self, id: &K) -> Option<V>;
     fn insert(&self, value: V) -> RepositoryResult<V>;
     fn update(&self, value: V) -> RepositoryResult<V>;
+    fn delete(&self, id: &K) -> RepositoryResult<K>;
 }
 
 pub trait SerialIdRepository<M>
@@ -239,8 +261,7 @@ where
     fn next_id(&self) -> u64 {
         Self::with_generator(|v| {
             let id = *v.get();
-            v.set(id + 1).unwrap();
-            id
+            v.set(id + 1).unwrap()
         })
     }
 }
@@ -327,12 +348,17 @@ impl IndexManagementRepository<(ConversationId, Reverse<MessageId>), MessageId>
         let last_id = cursor.map_or(MessageId::MAX, |c| c.saturating_sub(1));
         let start = (conversation, Reverse(last_id));
         let end = (conversation, Reverse(1));
-        CHAT_MESSAGE_CONVERSATION_INDEX.with_borrow(|m| {
-            m.range(start..=end)
-                .take(limit)
-                .map(|((_, id), _)| id.0)
-                .collect_vec()
-        })
+        if limit == usize::default() {
+            CHAT_MESSAGE_CONVERSATION_INDEX
+                .with_borrow(|m| m.range(start..=end).map(|((_, id), _)| id.0).collect_vec())
+        } else {
+            CHAT_MESSAGE_CONVERSATION_INDEX.with_borrow(|m| {
+                m.range(start..=end)
+                    .take(limit)
+                    .map(|((_, id), _)| id.0)
+                    .collect_vec()
+            })
+        }
     }
 }
 
@@ -382,6 +408,17 @@ impl Repository<MessageId, Message> for MessageRepository {
             reason: "Message entity cannot be updated".to_string(),
         })
     }
+
+    /// delete message by id, if such id does not exist, return NotFound error.
+    fn delete(&self, id: &MessageId) -> RepositoryResult<MessageId> {
+        let old = CHAT_MESSAGE.with_borrow_mut(|m| m.remove(&Reverse(*id)));
+        if old.is_none() {
+            Err(RepositoryError::NotFound)
+        } else {
+            self.remove_indexes(&old.unwrap());
+            Ok(*id)
+        }
+    }
 }
 
 impl MessageRepository {
@@ -399,6 +436,19 @@ impl MessageRepository {
             .filter_map(|id| self.get(id))
             .collect_vec();
         (messages.last().map(|m| m.id), messages)
+    }
+
+    pub fn delete_by_conversation(
+        &self,
+        conversation: &ConversationId,
+    ) -> RepositoryResult<Vec<MessageId>> {
+        let deleted_ids = self
+            .conversation_index
+            .find(*conversation, None, 0)
+            .iter()
+            .filter_map(|id| self.delete(id).ok())
+            .collect_vec();
+        Ok(deleted_ids)
     }
 }
 
@@ -442,7 +492,7 @@ impl IndexManagementRepository<ConversationIndex, ConversationId>
         let start = (user_id, Reverse(ts), 0);
         let end = (user_id, Reverse(0), ConversationId::MAX);
 
-        if limit == 0 {
+        if limit == usize::default() {
             CONVERSATION_USER_INDEX
                 .with_borrow(|m| m.range(start..=end).map(|((_, _, c_id), _)| c_id).collect())
         } else {
@@ -516,6 +566,16 @@ impl Repository<ConversationId, Conversation> for ConversationRepository {
 
         Ok(conversation)
     }
+
+    fn delete(&self, id: &ConversationId) -> RepositoryResult<ConversationId> {
+        let old = CONVERSATION.with_borrow_mut(|m| m.remove(id));
+        if old.is_none() {
+            Err(RepositoryError::NotFound)
+        } else {
+            self.remove_indexes(&old.unwrap());
+            Ok(*id)
+        }
+    }
 }
 
 impl ConversationRepository {
@@ -550,6 +610,10 @@ pub struct UserIdentityIndexRepository;
 #[derive(Debug, Default)]
 pub struct UserRepository {
     identity_index: UserIdentityIndexRepository,
+}
+
+pub trait IdentityProvider {
+    fn get_user(&self, identity: Principal) -> Option<User>;
 }
 
 impl IndexManagementRepository<(Principal, UserId), UserId> for UserIdentityIndexRepository {
@@ -628,10 +692,20 @@ impl Repository<UserId, User> for UserRepository {
         self.save_indexes(&user, prev.as_ref());
         Ok(user)
     }
+
+    fn delete(&self, id: &UserId) -> RepositoryResult<UserId> {
+        let old = USER.with_borrow_mut(|m| m.remove(id));
+        if old.is_none() {
+            Err(RepositoryError::NotFound)
+        } else {
+            self.remove_indexes(&old.unwrap());
+            Ok(*id)
+        }
+    }
 }
 
-impl UserRepository {
-    pub fn get_by_identity(&self, identity: Principal) -> Option<User> {
+impl IdentityProvider for UserRepository {
+    fn get_user(&self, identity: Principal) -> Option<User> {
         self.identity_index
             .find(identity, None, 0)
             .iter()
@@ -640,9 +714,17 @@ impl UserRepository {
     }
 }
 
+lazy_static! {
+    pub static ref MESSAGE_REPOSITORY: Arc<MessageRepository> =
+        Arc::new(MessageRepository::default());
+    pub static ref CONVERSATION_REPOSITORY: Arc<ConversationRepository> =
+        Arc::new(ConversationRepository::default());
+    pub static ref USER_REPOSITORY: Arc<UserRepository> = Arc::new(UserRepository::default());
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::utils::mock_timestamp;
+    use crate::utils::mock_ic0;
 
     use super::*;
 
@@ -688,6 +770,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_roles_from_str_should_works() {
+        let r = "user".parse::<Roles>().unwrap();
+        assert!(matches!(r, Roles::User));
+        let r: Roles = "assistant".parse().unwrap();
+        assert!(matches!(r, Roles::Assistant));
+        let s = String::from("system");
+        let r: Roles = s.parse().unwrap();
+        assert!(matches!(r, Roles::System));
+    }
+
+    #[test]
+    #[should_panic]
+    fn parse_roles_from_unknown_str_should_failed() {
+        "jedi".parse::<Roles>().unwrap();
+    }
+
+    #[test]
     fn storable_encoding_decoding_should_valid() {
         let message = Message {
             id: 1,
@@ -712,7 +811,7 @@ mod tests {
 
         let user = User {
             id: 1,
-            username: "test_user".to_string(),
+            fullname: "test_user".to_string(),
             identity: Principal::anonymous(),
             resume: "engineer".to_string(),
         };
@@ -769,6 +868,71 @@ mod tests {
             role: Roles::Assistant,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn delete_message_should_work() {
+        reset_msg_data();
+        let repo = MessageRepository::default();
+        (0..3).for_each(|i| {
+            repo.insert(Message {
+                id: 0,
+                conversation: 0,
+                content: format!("number-{}", i),
+                timestamp: 0,
+                role: Roles::User,
+            })
+            .unwrap();
+        });
+        repo.delete(&2).unwrap();
+        assert!(repo.get(&2).is_none());
+    }
+
+    #[test]
+    #[should_panic]
+    fn delete_non_exist_message_should_failed() {
+        reset_msg_data();
+        let repo = MessageRepository::default();
+        (0..3).for_each(|i| {
+            repo.insert(Message {
+                id: 0,
+                conversation: 0,
+                content: format!("number-{}", i),
+                timestamp: 0,
+                role: Roles::User,
+            })
+            .unwrap();
+        });
+        repo.delete(&10).unwrap();
+    }
+
+    #[test]
+    fn delete_messge_by_conversation_should_work() {
+        reset_msg_data();
+        let repo = MessageRepository::default();
+        (0..3).for_each(|i| {
+            repo.insert(Message {
+                id: 0,
+                conversation: 1,
+                content: format!("number-{}", i),
+                timestamp: 0,
+                role: Roles::User,
+            })
+            .unwrap();
+        });
+        (0..5).for_each(|i| {
+            repo.insert(Message {
+                id: 0,
+                conversation: 7,
+                content: format!("number-{}", i),
+                timestamp: 0,
+                role: Roles::User,
+            })
+            .unwrap();
+        });
+        repo.delete_by_conversation(&1).unwrap();
+        assert!(repo.paged_list(1, None, usize::default()).1.is_empty());
+        assert_eq!(5, repo.paged_list(7, None, usize::default()).1.len());
     }
 
     #[test]
@@ -832,7 +996,7 @@ mod tests {
     fn get_and_upsert_conversation_should_work() {
         reset_conv_data();
         let repo = ConversationRepository::default();
-        let conversation = Conversation {
+        let mut conversation = Conversation {
             id: 1,
             user: 1,
             updated_at: 1234567890,
@@ -840,13 +1004,48 @@ mod tests {
         };
         repo.upsert(conversation.clone()).unwrap();
         assert!(repo.get(&1).is_some());
-        assert_eq!("Test Conversation".to_string(), repo.get(&1).unwrap().name);
+        assert_eq!("Test Conversation", repo.get(&1).unwrap().name);
+        conversation.name = "Updated Conversation".to_string();
+        repo.upsert(conversation).unwrap();
+        assert_eq!("Updated Conversation", repo.get(&1).unwrap().name);
+    }
+
+    #[test]
+    fn delete_conversation_should_work() {
+        reset_conv_data();
+        let repo = ConversationRepository::default();
+        repo.insert(Conversation {
+            id: 0,
+            user: 1,
+            updated_at: 0,
+            name: String::from("abc"),
+        })
+        .unwrap();
+        assert!(repo.get(&1).is_some());
+        repo.delete(&1).unwrap();
+        assert!(repo.get(&1).is_none());
+    }
+
+    #[test]
+    #[should_panic]
+    fn delete_non_exist_conversation_should_failed() {
+        reset_conv_data();
+        let repo = ConversationRepository::default();
+        repo.insert(Conversation {
+            id: 0,
+            user: 1,
+            updated_at: 0,
+            name: String::from("abc"),
+        })
+        .unwrap();
+        assert!(repo.get(&1).is_some());
+        repo.delete(&3).unwrap();
     }
 
     #[test]
     fn conversation_cursor_paged_list_should_return_correct_list() {
         reset_conv_data();
-        mock_timestamp::reset_to(1);
+        mock_ic0::reset_timestamp_to(1);
         let repo = ConversationRepository::default();
 
         // 1-5 for user 1
@@ -904,13 +1103,69 @@ mod tests {
         let repo = UserRepository::default();
         let user = User {
             id: 0,
-            username: "fulan".to_string(),
+            fullname: "fulan".to_string(),
             identity: Principal::anonymous(),
             resume: "profile".to_string(),
         };
         repo.insert(user).unwrap();
         assert!(repo.get(&1).is_some());
-        assert_eq!("fulan", repo.get(&1).unwrap().username);
+        assert_eq!("fulan", repo.get(&1).unwrap().fullname);
+    }
+
+    #[test]
+    fn update_user_should_work() {
+        reset_user_data();
+        let repo = UserRepository::default();
+        repo.insert(User {
+            id: 0,
+            fullname: "fulan".to_string(),
+            identity: Principal::anonymous(),
+            resume: "profile".to_string(),
+        })
+        .unwrap();
+        assert!(repo.get(&1).is_some());
+        assert_eq!("fulan", repo.get(&1).unwrap().fullname);
+        repo.update(User {
+            id: 1,
+            fullname: "fulanah".to_string(),
+            identity: Principal::anonymous(),
+            resume: "profile".to_string(),
+        })
+        .unwrap();
+        assert_eq!("fulanah", repo.get(&1).unwrap().fullname);
+    }
+
+    #[test]
+    fn delete_user_should_work() {
+        reset_user_data();
+        let repo = UserRepository::default();
+        repo.insert(User {
+            id: 0,
+            fullname: "fulan".to_string(),
+            identity: Principal::anonymous(),
+            resume: "profile".to_string(),
+        })
+        .unwrap();
+        assert!(repo.get(&1).is_some());
+        repo.delete(&1).unwrap();
+        assert!(repo.get(&1).is_none());
+    }
+
+    #[test]
+    #[should_panic]
+    fn delete_non_exist_user_should_failed() {
+        reset_user_data();
+        let repo = UserRepository::default();
+        repo.insert(User {
+            id: 0,
+            fullname: "fulan".to_string(),
+            identity: Principal::anonymous(),
+            resume: "profile".to_string(),
+        })
+        .unwrap();
+        assert!(repo.get(&1).is_some());
+        assert!(repo.get(&2).is_none());
+        repo.delete(&2).unwrap();
     }
 
     #[test]
@@ -921,20 +1176,20 @@ mod tests {
         let identity = Principal::from_text("2chl6-4hpzw-vqaaa-aaaaa-c").unwrap();
         repo.insert(User {
             id: 0,
-            username: "user1".to_string(),
+            fullname: "user1".to_string(),
             identity: identity.clone(),
             resume: "user1".to_string(),
         })
         .unwrap();
         repo.insert(User {
             id: 0,
-            username: "user2".to_string(),
+            fullname: "user2".to_string(),
             identity: Principal::anonymous(),
             resume: "user2".to_string(),
         })
         .unwrap();
-        let q = repo.get_by_identity(identity);
+        let q = repo.get_user(identity);
         assert!(q.is_some());
-        assert_eq!("user1", q.unwrap().username);
+        assert_eq!("user1", q.unwrap().fullname);
     }
 }
